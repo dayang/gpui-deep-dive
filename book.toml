@@ -1,0 +1,12 @@
+[book]
+authors = ["GPUI 社区"]
+language = "zh-CN"
+
+src = "src"
+title = "深入 GPUI：从使用到原理"
+
+[output.html]
+mathjax-support = true
+
+[output.html.print]
+enable = false
