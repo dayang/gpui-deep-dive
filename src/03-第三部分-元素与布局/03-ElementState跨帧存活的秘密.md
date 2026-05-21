@@ -6,60 +6,48 @@
 
 ## 存储机制
 
+Element state 存储在 `Window` 的双缓冲 `Frame` 中（`src/window.rs:670, 900-904`）：
+
 ```rust
-// Window 中
-pub(crate) struct Window {
-    // ...
-    element_state: FxHashMap<GlobalElementId, Box<dyn Any>>,
-    // ...
+// Frame 中
+pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
+
+pub(crate) struct ElementStateBox {
+    pub(crate) inner: Box<dyn Any>,
+    #[cfg(debug_assertions)]
+    pub(crate) type_name: &'static str,
 }
 ```
 
-`element_state` 就是一个 HashMap，key 是 `GlobalElementId`，value 是类型擦除的任意值。
+注意三个关键点：
+1. **Key 是 `(GlobalElementId, TypeId)` 的二元组**——同一个元素 ID 可以存储多种不同类型的 state，由 `TypeId` 区分。
+2. **Value 是 `ElementStateBox`**——包装了 `Box<dyn Any>`，并在 debug 模式下记录类型名。
+3. **状态在双缓冲的 `Frame` 之间迁移**——每帧结束时，上一帧中仍被访问的状态迁移到新帧（`window.rs:805-811`）。
 
-`GlobalElementId` 是一个 `SmallVec<[ElementId; 32]>` ——路径向量。在 prepaint 阶段被推入：
-
-```
-Window::prepaint() 在遍历树时：
-  进入 div#root → push "root" → 路径 = [root]
-    进入 div#sidebar → push "sidebar" → 路径 = [root, sidebar]
-      进入 button#save → push "save" → 路径 = [root, sidebar, save]
-        → 以 [root, sidebar, save] 查找/存储 element state
-      退出 button#save → pop
-    退出 div#sidebar → pop
-  退出 div#root → pop
-```
+`GlobalElementId` 是一个 `SmallVec<[ElementId; 32]>` ——路径向量。在 prepaint/paint 阶段被推入。
 
 ## 状态的存取
 
-元素的实现中典型访问模式：
+GPUI 不直接暴露 `element_states` HashMap。元素通过 `Window::with_element_state()` 访问（`src/window.rs:2628-2703`）：
 
 ```rust
-// 读取已有状态（跨帧生命）
-if let Some(state) = window.element_state::<MyState>(&element_id) {
-    // 使用上一帧保存的状态
-}
-
-// 存储状态
-window.set_element_state::<MyState>(&element_id, MyState { ... });
+// Window 的公开 API
+pub fn with_element_state<S, R>(
+    &mut self,
+    global_id: GlobalElementId,
+    f: impl FnOnce(Option<&mut S>, &mut Window) -> R,
+) -> R
 ```
 
-`Stateful<E>` 封装了这种模式，提供更便捷的 API：
+这个方法在内部：
+1. 以 `(global_id, TypeId::of::<S>())` 为 key 查询 `next_frame.element_states`。
+2. 如果没找到，回退查询 `rendered_frame.element_states`（上一帧的状态）。
+3. 如果存在，取出 `ElementStateBox`，downcast 为 `S`，传入闭包。
+4. 如果不存在，传入 `None`。
+5. 闭包执行后，将状态（可能为新创建的）存回 `next_frame.element_states`。
 
-```rust
-div().id("scroll").child(
-    Stateful::new(|element_id, window, _cx| {
-        // 尝试恢复状态
-        let state = window.element_state::<ScrollState>(&element_id)
-            .cloned()
-            .unwrap_or_default();
-        // ... 使用 state
-    })
-    .on_element_state_changed(|element_id, state, window, _cx| {
-        // 状态更新回调
-    })
-)
-```
+每帧结束时（`Frame::finish()`），`accessed_element_states` 列表中的状态从 `prev_frame` 迁移到 `next_frame`。未被访问的状态自然丢弃。
+
 
 ## 状态丢失的场景
 

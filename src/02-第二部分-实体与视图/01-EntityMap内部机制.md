@@ -7,75 +7,129 @@
 ## 数据结构
 
 ```rust
-pub struct EntityMap {
-    entities: SecondaryMap<EntityId, Option<Box<dyn Any>>>,
-    ref_counts: Arc<RwLock<SlotMap<EntityId, EntityRefCounts>>>,
-    // ...
+// src/app/entity_map.rs:57-68
+pub(crate) struct EntityMap {
+    entities: SecondaryMap<EntityId, Box<dyn Any>>,
+    pub accessed_entities: RefCell<FxHashSet<EntityId>>,
+    ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
-pub struct EntityRefCounts {
-    entity_ref_count: usize,    // Entity<T> 的存活数
-    weak_ref_count: usize,      // WeakEntity<T> 的存活数
-    any_ref_count: usize,       // AnyEntity 的存活数
+struct EntityRefCounts {
+    counts: SlotMap<EntityId, AtomicUsize>,
+    dropped_entity_ids: Vec<EntityId>,
+    #[cfg(any(test, feature = "leak-detection"))]
+    leak_detector: LeakDetector,
 }
 ```
 
 三层结构：
 
-1. **`entities: SecondaryMap`**：实际的 `T` 值存在这里。当你调用 `cx.new()` 时，`T` 被装箱并插入。
-2. **`ref_counts`**：独立的 `RwLock<SlotMap>`，追踪三种句柄的引用计数。
-3. **`reservations`**：预留槽位（`Reservation<T>`），用于先占位后填入。
+1. **`entities: SecondaryMap<EntityId, Box<dyn Any>>`**：实际的数据存储。`SecondaryMap` 是与 `SlotMap` 共享 key 空间的关联映射。每个实体以 `Box<dyn Any>` 形式存在。
+2. **`ref_counts: Arc<RwLock<EntityRefCounts>>`**：引用计数层。这里的 `EntityRefCounts` 内部是一个 `SlotMap<EntityId, AtomicUsize>`——每个 `EntityId` 对应一个 `AtomicUsize` 计数器。它还维护了 `dropped_entity_ids` 列表，记录了引用计数归零但尚未清理的实体。
+3. **`accessed_entities: RefCell<FxHashSet<EntityId>>`**：当前帧中被访问过的实体集合，用于脏检测（dirty checking）。
 
-引用计数和实际数据分离的设计是为了**减少锁竞争**——`clone()` / `drop()` 句柄时只需要写引用计数（Hash + 原子操作），不需要碰实体数据。
+引用计数和实际数据分离的设计有两个好处：
+- `clone()` / `drop()` 句柄时只需要原子操作更新 `counts` 中的计数，不需要碰实体数据。
+- `EntityRefCounts` 被 `Arc<RwLock<>>` 包裹，意味者多个线程可以同时读引用计数（例如并行 clone 句柄）。
 
 ## `Entity<T>` 的解剖
 
 ```rust
+// src/app/entity_map.rs:376-382
+#[derive(Deref, DerefMut)]
 pub struct Entity<T> {
-    pub(crate) entity_id: EntityId,
-    pub(crate) ref_counts: Arc<Weak<RwLock<SlotMap<EntityId, EntityRefCounts>>>>,
-    _phantom: PhantomData<T>,  // 仅用于类型安全，运行时不占空间
+    #[deref]
+    #[deref_mut]
+    pub(crate) any_entity: AnyEntity,
+    pub(crate) entity_type: PhantomData<fn(T) -> T>,
 }
 ```
 
-`Entity<T>` 很小——两个指针大小（`EntityId` 是 32 位 key，`Arc` 是一个指针）。clone 它是廉价的。
-
-`PhantomData<T>` 不占运行时空间，但确保你无法把 `Entity<Counter>` 赋值给 `Entity<TodoList>`。
-
-### 为什么引用计数需要 `Arc<Weak<RwLock<...>>>`？
-
-```
-Entity<Counter> ──Arc<Weak<...>>──→ RwLock<SlotMap<...>>
-                                        ↑
-Entity<Counter> （另一个 clone）─────────┘
-                                        ↑
-WeakEntity<Counter> ──Weak<...>─────────┘
-```
-
-- **`Arc`**（在 `Entity` 这边）：`Entity<T>` 的每个 clone 都持有一个 `Arc`，drop 时 Arc 减引用计数。
-- **`Weak`**（在 `ref_counts` 这边）：`WeakEntity<T>` 只持有一个 `Weak`，不阻止释放。
-- **`RwLock`**：允许多个 `clone()` 同时读。
-
-当最后一个 `Entity<T>` 被 drop 后，`entity_ref_count` 归零，框架清理 `EntityMap` 中的对应条目。但如果有 `WeakEntity<T>` 存活，它 `upgrade()` 时会得到 `None`。
-
-## GpuiBorrow：RAII 租约
+`Entity<T>` 本身只有两个字段：一个 `AnyEntity`（类型擦除的句柄）+ 一个编译期幻影类型。真正的数据都在 `AnyEntity` 中：
 
 ```rust
-pub(crate) struct GpuiBorrow<'a, T: 'static> {
-    entity_id: EntityId,
-    any_value: Box<dyn Any>,
-    entity_map: &'a mut EntityMap,
-    became_dirty: bool,
+// src/app/entity_map.rs:221-227
+pub struct AnyEntity {
+    pub(crate) entity_id: EntityId,
+    pub(crate) entity_type: TypeId,
+    entity_map: Weak<RwLock<EntityRefCounts>>,
+    #[cfg(any(test, feature = "leak-detection"))]
+    handle_id: HandleId,
 }
 ```
 
-当你调用 `update_entity()` 时：
+- **`entity_id: EntityId`**：slotmap key，定位 `EntityMap.entities` 中的数据。
+- **`entity_type: TypeId`**：运行时类型标记，用于 `downcast`。
+- **`entity_map: Weak<RwLock<EntityRefCounts>>`**：弱引用指向 `EntityRefCounts`。在 `clone()` 时通过 `upgrade()` 获取计数 map 并递增；在 `drop()` 时递减计数。
 
-1. `Box<dyn Any>` 从 `EntityMap` **物理移出**（不再是 `Option::Some`，变成 `Option::None`）。
-2. `downcast_mut::<T>()` 获取 `&mut T`。
-3. 你的闭包执行。
-4. Drop 时，`Box<dyn Any>` **放回** EntityMap。
-5. 如果设置了 `became_dirty`，自动调用 `notify()`。
+`PhantomData<fn(T) -> T>` 不占运行时空间，但保证 `Entity<Counter>` 和 `Entity<TodoList>` 是不同类型——加上 `fn(T) -> T` 的写法同时使类型对协变（covariant），这对类型系统很重要。
+
+### Clone 和 Drop 的引用计数机制
+
+**Clone**（`src/app/entity_map.rs:463-470`）：
+```rust
+impl<T> Clone for Entity<T> {
+    fn clone(&self) -> Self {
+        Self {
+            any_entity: self.any_entity.clone(),  // 委托给 AnyEntity::clone
+            entity_type: self.entity_type,
+        }
+    }
+}
+```
+
+`AnyEntity::clone()` 内部通过 `self.entity_map.upgrade()` 获取 `EntityRefCounts`，找到 `entity_id` 对应的 `AtomicUsize`，执行 `fetch_add(1, SeqCst)`。插入断言防止引用已归零的实体。
+
+**Drop**（`src/app/entity_map.rs:307-332`）：
+```rust
+impl Drop for AnyEntity {
+    fn drop(&mut self) {
+        if let Some(entity_map) = self.entity_map.upgrade() {
+            let entity_map = entity_map.upgradable_read();
+            let count = entity_map.counts.get(self.entity_id)
+                .expect("detected over-release of a handle.");
+            let prev_count = count.fetch_sub(1, SeqCst);
+            assert_ne!(prev_count, 0, "Detected over-release of a entity.");
+            if prev_count == 1 {
+                // 我们是最后一个引用，可以标记为待清理
+                let mut entity_map = RwLockUpgradableReadGuard::upgrade(entity_map);
+                entity_map.dropped_entity_ids.push(self.entity_id);
+            }
+        }
+    }
+}
+```
+
+Drop 时先递减 `AtomicUsize`。如果减到 0（说明 `prev_count == 1`），将 `entity_id` 推入 `dropped_entity_ids`，等待 `EntityMap::take_dropped()` 在下一轮 `flush_effects` 中真正清理。
+
+## `Lease<T>`：RAII 租约
+
+```rust
+// src/app/entity_map.rs:189-215
+pub(crate) struct Lease<T> {
+    entity: Option<Box<dyn Any>>,
+    pub id: EntityId,
+    entity_type: PhantomData<T>,
+}
+```
+
+`EntityMap::lease()` 从 `entities` map 中**物理移出** `Box<dyn Any>`（源码第 113-116 行），存入 `Lease`。`Lease` 通过 `Deref`/`DerefMut` 暴露 `&T` / `&mut T`。操作完毕后调用 `EntityMap::end_lease()` 将数据放回。
+
+`Lease` 的 `Drop` 实现有个保护：如果 `end_lease` 没被调用而 `Lease` 被 drop（正常路径不该发生），它会 panic。
+
+## GpuiBorrow：对外暴露的租约包装
+
+```rust
+// src/app.rs:2373-2376
+pub struct GpuiBorrow<'a, T> {
+    inner: Option<Lease<T>>,
+    app: &'a mut App,
+}
+```
+
+`GpuiBorrow` 包装了 `Lease<T>` 并持有 `&mut App`。它的 `Drop` 实现会：
+1. 调用 `end_lease` 将数据放回 `EntityMap`。
+2. 如果实体被标记为 dirty，自动调用 `notify()`。
 
 这种"移除-租借-归还"模式是 GPUI 实现动态借用检查的秘诀——**数据在你使用时不在 map 中，所以不可能有双重借用**。
 
@@ -89,15 +143,32 @@ let handle: Entity<Counter> = cx.new(|_| Counter { count: 0 });
 let weak: WeakEntity<Counter> = handle.downgrade();
 
 // 类型擦除——可以存储不同类型的实体
-let any: AnyEntity = handle.into();
+let any: AnyEntity = handle.into_any();
 ```
 
 | | Entity\<T\> | WeakEntity\<T\> | AnyEntity |
 |---|---|---|---|
 | **类型** | 保留 T | 保留 T | 类型擦除 |
 | **阻止释放** | 是 | 否 | 是 |
-| **访问数据** | 直接 update/read | 需 upgrade → Option\<Entity\<T\>\> | 需 downcast |
+| **访问数据** | `.read(cx)` / `.update(cx, f)` | 需 `.upgrade()` → `Option<Entity<T>>` | 需 `.downcast::<T>()` |
+| **内部引用** | 通过 `AnyEntity` 间接持有 `Weak<EntityRefCounts>` | 持有 `Weak<EntityRefCounts>` | 持有 `Weak<EntityRefCounts>` + `TypeId` |
 | **典型用途** | View handle, 字段存储 | 观察者回调（避免循环引用） | 集合/列表存储 |
+
+## `WeakEntity<T>` 的 upgrade 流程
+
+```rust
+// src/app/entity_map.rs:681-686
+impl<T: 'static> WeakEntity<T> {
+    pub fn upgrade(&self) -> Option<Entity<T>> {
+        Some(Entity {
+            any_entity: self.any_entity.upgrade()?,
+            entity_type: self.entity_type,
+        })
+    }
+}
+```
+
+底层 `AnyWeakEntity::upgrade()` 做了原子操作：通过 `entity_ref_counts.upgrade()` 获取 `EntityRefCounts`，然后检查对应 `entity_id` 的 `AtomicUsize` 是否大于 0。如果用 `atomic_incr_if_not_zero` 成功递增（返回值 > 0），则创建新的 `AnyEntity`；如果计数已为 0 或 entity_id 已在 `dropped_entity_ids` 中，返回 `None`。
 
 ## Reservation：解决循环引用
 
@@ -105,43 +176,64 @@ let any: AnyEntity = handle.into();
 
 ```rust
 struct Parent {
-    child: Option<Entity<Child>>, // 需要引用 Child
+    child: Option<Entity<Child>>,
 }
 struct Child {
-    parent: Option<WeakEntity<Parent>>, // 弱引用 Parent，避免循环
+    parent: Option<WeakEntity<Parent>>, // 弱引用，避免循环
 }
 ```
 
-但如果 `Parent` 的构造需要 `Child` 的句柄，`Child` 的构造又需要 `Parent` 的句柄呢？Reservation 解决了这个先有鸡还是先有蛋的问题：
+但如果 `Parent` 的构造需要 `Child` 的句柄，`Child` 的构造又需要 `Parent` 的句柄呢？`EntityMap::reserve()` 解决了这个先有鸡还是先有蛋的问题：
 
 ```rust
-// 1. 预留两个槽位
-let parent_reservation = cx.reserve::<Parent>();
-let child_reservation = cx.reserve::<Child>();
+// src/app/entity_map.rs:88-104
+// 1. reserve 在 ref_counts 中先插入计数 1，返回 Slot<T>
+let parent_slot = cx.reserve::<Parent>();  // → Slot<Parent>
+let child_slot = cx.reserve::<Child>();    // → Slot<Child>
 
-// 2. 此时 Entity 还不存在，但 EntityId 已分配
-let parent_entity = parent_reservation.entity(); // Entity<Parent>
-let child_entity = child_reservation.entity();   // Entity<Child>
+// Slot<T> 实现了 Deref<Entity<T>>，所以可以作为实体句柄使用
+let parent_entity: Entity<Parent> = parent_slot.0;
+let child_entity: Entity<Child> = child_slot.0;
 
-// 3. 用预留的 Entity 插入实际数据
-cx.insert(parent_reservation, Parent {
+// 2. insert 将实际数据写入 entities map
+cx.insert(parent_slot, Parent {
     child: Some(child_entity.clone()),
 });
-cx.insert(child_reservation, Child {
+cx.insert(child_slot, Child {
     parent: Some(parent_entity.downgrade()),
 });
 ```
 
+关键：`reserve` 在 `ref_counts.counts` 中插入 `AtomicUsize(1)`，同时创建 `Entity<T>` 句柄。此时 `entities` map 中尚无实际数据——句柄已经可用，但调用 `.read()` 会失败。只有当 `insert` 执行后数据才就位。
+
 ## 实体何时被清理？
 
-一个实体从 EntityMap 中移除需要同时满足：
+清理分三步（`src/app/entity_map.rs:158-178`）：
 
-1. 所有 `Entity<T>` 句柄被 drop（`entity_ref_count == 0`）
-2. 所有 `AnyEntity` 句柄被 drop（`any_ref_count == 0`）
-3. `WeakEntity<T>` 不影响（`weak_ref_count` 可以非零）
+```rust
+pub fn take_dropped(&mut self) -> Vec<(EntityId, Box<dyn Any>)> {
+    let mut ref_counts = self.ref_counts.write();
+    let dropped_entity_ids = mem::take(&mut ref_counts.dropped_entity_ids);
 
-清理在 `flush_effects` 过程中发生，不是在句柄 drop 时立即发生。
+    dropped_entity_ids
+        .into_iter()
+        .filter_map(|entity_id| {
+            let count = ref_counts.counts.remove(entity_id).unwrap();
+            debug_assert_eq!(count.load(SeqCst), 0,
+                "dropped an entity that was referenced");
+            // 从 entities 中移除数据（如果是通过 reserve 预留但未 insert，可能为 None）
+            Some((entity_id, self.entities.remove(entity_id)?))
+        })
+        .collect()
+}
+```
+
+1. 最后一个 `Entity<T>` drop → `AtomicUsize` 减到 0 → `entity_id` 推入 `dropped_entity_ids`。
+2. `flush_effects` 循环中，`App::finish_update()` 调用 `entity_map.take_dropped()`。
+3. `take_dropped` 验证计数确实为 0，从 `counts` slotmap 和 `entities` secondary map 中移除数据，返回给调用者（调用者可能触发 drop 副作用）。
+
+清理不是在句柄 drop 时立即发生的——要等到下一轮 `flush_effects`。
 
 ---
 
-**如果你只记住一件事：** `Entity<T>` 是一个轻量句柄（ID + 引用计数），数据在 `EntityMap` 的 slotmap 中。借出数据时采用 "移除-操作-归还" 模式，Rust 编译期看不到这个正确性，但 GPUI 在运行时保证了安全。
+**如果你只记住一件事：** `Entity<T>` 通过 `AnyEntity` 间接持有 `Weak<EntityRefCounts>`，数据在 `EntityMap.entities` 中。引用计数是单个 `AtomicUsize`（不是三个独立字段）。借出数据用 `Lease<T>` 的 "移除-操作-归还" 模式。清理分两步：计数归零 → 标记 dropped → `take_dropped()` 真正移除。

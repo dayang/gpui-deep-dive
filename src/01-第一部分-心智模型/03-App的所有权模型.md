@@ -26,10 +26,10 @@ GPUI 的所有权结构是一棵借用树，根是 `App`：
 App (通过 RefCell 实现内部可变性)
   │
   ├── Context<'a, Counter> ──┬── &'a mut App
-  │                          └── WeakEntity<Counter>（"我是谁"）
+  │                          └── entity_state: WeakEntity<Counter>
   │
   ├── Context<'a, TodoList> ──┬── &'a mut App
-  │                           └── WeakEntity<TodoList>
+  │                           └── entity_state: WeakEntity<TodoList>
   │
   └── ...
 ```
@@ -69,29 +69,48 @@ let entity: Entity<Counter> = cx.new(|_| Counter { count: 0 });
 2. **借用检查更灵活**：因为数据在 `EntityMap` 的 slotmap 中（通过 `Box<dyn Any>` 抹除类型），框架可以在运行时"借出"一个实体的 `&mut T` 而不会在编译期就把整个 `App` 锁死。
 3. **通知自动化**：当 `GpuiBorrow<T>`（借出 guard）drop 时，框架自动检查是否有变化并触发 notify。
 
-## 借出的机制：GpuiBorrow
+## 借出的机制：Lease 和 GpuiBorrow
 
-当你调用 `cx.update_entity::<Counter, _>(entity_id, |counter, cx| ...)` 时，内部发生了：
+当你调用 `entity.update(cx, |counter, cx| ...)` 时，实际的流程是：
 
 ```rust
-// 简化的伪代码
-fn update_entity<T: 'static>(
-    app: &mut App,
-    entity_id: EntityId,
-    f: impl FnOnce(&mut T, &mut App) -> R,
-) -> R {
-    // 1. 从 slot map 中取出 Box<dyn Any>
-    let boxed = app.entity_map.remove(entity_id);
-    // 2. 向下转型为 &mut T
-    let value: &mut T = boxed.downcast_mut().unwrap();
-    // 3. 执行你的闭包
-    let result = f(value, app);
-    // 4. 放回 slot map
-    app.entity_map.insert(entity_id, boxed);
-    // 5. 检查是否需要 notify（GpuiBorrow 的 Drop 负责）
-    result
+// src/app/entity_map.rs:108-123 — EntityMap::lease()
+pub fn lease<T>(&mut self, pointer: &Entity<T>) -> Lease<T> {
+    self.assert_valid_context(pointer);
+    let mut accessed_entities = self.accessed_entities.borrow_mut();
+    accessed_entities.insert(pointer.entity_id);
+
+    // 从 entities map 中物理移出 Box<dyn Any>
+    let entity = Some(
+        self.entities
+            .remove(pointer.entity_id)
+            .unwrap_or_else(|| double_lease_panic::<T>("update")),
+    );
+    Lease {
+        entity,
+        id: pointer.entity_id,
+        entity_type: PhantomData,
+    }
+}
+
+// src/app/entity_map.rs:125-128 — 归还
+pub fn end_lease<T>(&mut self, mut lease: Lease<T>) {
+    self.entities.insert(lease.id, lease.entity.take().unwrap());
 }
 ```
+
+`Lease<T>` 实现了 `Deref<Target=T>` 和 `DerefMut`，所以你可以像操作 `&mut T` 一样操作它。操作完毕后 `end_lease()` 将数据放回。
+
+而 `GpuiBorrow<'a, T>`（`src/app.rs:2373-2376`）包装了 `Lease<T>` 并额外持有 `&'a mut App`：
+
+```rust
+pub struct GpuiBorrow<'a, T> {
+    inner: Option<Lease<T>>,
+    app: &'a mut App,
+}
+```
+
+`GpuiBorrow` 的 `Drop` 会调用 `end_lease()` 归还数据，然后检查实体是否被标记为 dirty——如果是，自动触发 `notify()`。
 
 这个 remove-操作-放回的"租约"模式确保：在你持有 `&mut T` 时，`T` 不在 map 中，所以不会有其他代码同时访问它。Rust 编译期的借用检查无法表达这种动态 slot map 借用，但运行时保证安全。
 
@@ -137,4 +156,4 @@ cx.spawn(|mut cx| async move {
 
 ---
 
-**如果你只记住一件事：** `Context<'a, T>` = `&'a mut App` + 实体 ID。数据不在 Entity 句柄里，在 App 的 EntityMap 里。这是 GPUI 所有权模型的所有核心约束的来源。
+**如果你只记住一件事：** `Context<'a, T>` = `&'a mut App` + `WeakEntity<T>`。数据不在 Entity 句柄里，在 App 的 EntityMap 里。访问数据通过 `Lease<T>` 的租约模式。这是 GPUI 所有权模型的所有核心约束的来源。

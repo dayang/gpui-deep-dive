@@ -1,219 +1,122 @@
 # 第 17 章：smol 运行时集成
 
-GPUI 的异步运行时基于 `smol`，不是 `tokio`。这是一个深思熟虑的选择，与 GPUI 的设计理念密切相关。
+GPUI 的异步运行时基于 `smol`，不是 `tokio`。
 
-> 源文件参考：`src/executor.rs`、`src/platform.rs` 中 PlatformDispatcher trait
-
-## 为什么是 smol 而不是 tokio？
-
-| | tokio | smol |
-|---|---|---|
-| **代码量** | ~100K+ 行 | ~10K 行 |
-| **依赖数** | 大量 | 极少 |
-| **生态** | 非常成熟 | 较小 |
-| **核心抽象** | 自己的 reactor + 线程池 | 基于 `async-io` / `polling` |
-| **适合场景** | 高并发服务器 | 嵌入式/桌面应用 |
-
-GPUI 只需要小而精简的异步运行时——它不需要 tokio 的多线程 work-stealing、tracing 基础设施、或丰富的中间件生态。`smol` 的零开销设计和低依赖数量更适合作为 GUI 框架的内嵌运行时。
+> 源文件参考：`src/executor.rs`、`src/platform.rs` 的 `PlatformDispatcher` trait
 
 ## GPUI 的两级执行器
 
 ```rust
-// src/executor.rs
-pub struct BackgroundExecutor { /* ... */ } // 线程池，运行后台任务
-pub struct ForegroundExecutor { /* ... */ } // 运行在主线程
-```
-
-### ForegroundExecutor
-
-运行在主线程上（GUI 线程）。`!Send` ——设计上不可跨线程。
-
-```rust
-pub struct ForegroundExecutor {
-    // 通过 platform.dispatcher() 将任务提交到主线程事件循环
-    dispatcher: Arc<dyn PlatformDispatcher>,
-    // 主线程的任务队列
-    ready_tasks: RefCell<Vec<...>>,
-}
-```
-
-在 macOS 上，`PlatformDispatcher` 通过 GCD (`dispatch_async_f`) 将任务调度到主线程。在 Linux 上通过 `calloop`，Windows 上通过消息循环。
-
-### BackgroundExecutor
-
-一个线程池，用于 CPU 密集或 I/O 阻塞任务。所有后台任务都是 `Send + 'static`。
-
-```rust
+// src/executor.rs:31-48
 pub struct BackgroundExecutor {
-    // 内部的 smol::Executor 实例
-    // 每个 worker thread 一个
-    // 默认使用 num_cpus 报告的核心数
+    dispatcher: Arc<dyn PlatformDispatcher>,
+}
+
+pub struct ForegroundExecutor {
+    dispatcher: Arc<dyn PlatformDispatcher>,
+    not_send: PhantomData<Rc<()>>,  // 标记 !Send
 }
 ```
 
-## `Task<T>`：可取消的 Future
+- **`BackgroundExecutor`**：线程池，运行后台任务。`Send + Sync`。
+- **`ForegroundExecutor`**：主线程专用。`not_send: PhantomData<Rc<()>>` 确保编译器拒绝跨线程移动。
+- 两者共享同一个 `dispatcher: Arc<dyn PlatformDispatcher>`。
+
+实际线程池实现在各自的平台中——executor 结构体不直接包含 `smol::Executor`。smol 运行时嵌入在 `PlatformDispatcher` 的实现中。
+
+## Task\<T\>
 
 ```rust
-pub struct Task<T> {
-    handle: async_task::Task<T>,  // smol 的 async-task
+// src/executor.rs:58-67
+pub struct Task<T>(TaskState<T>);
+
+enum TaskState<T> {
+    Ready(Option<T>),
+    Spawned(async_task::Task<T>),
 }
+```
 
-impl<T> Task<T> {
-    pub async fn await(self) -> T { ... }
+`Task<T>` 的内部是 `TaskState<T>` 枚举——`Spawned` 状态持有一个 `async_task::Task<T>` handle。
 
-    pub fn detach(self) { ... }  // fire-and-forget
+### Task 的操作
 
-    pub fn cancel(self) {
-        // Drop Task → handle 被销毁 → Future 的 Drop 被调用
-    }
+- **`.await`**：`Task<T>` 实现了 `Future` trait（`src/executor.rs:100-109`），可以直接 `.await`。**没有名为 `await()` 的命名方法**。
+- **`detach()`**：丢弃 handle，让 future 在后台独立运行（fire-and-forget）。
+- **取消**：通过 `drop(task)` 实现——Drop 会取消内部的 `async_task::Task`。**没有名为 `cancel()` 的命名方法**。
+
+## PlatformDispatcher trait
+
+```rust
+// src/platform.rs:562-575
+pub(crate) trait PlatformDispatcher: Send + Sync {
+    fn is_main_thread(&self) -> bool;
+    fn dispatch(&self, runnable: Runnable, label: Option<TaskLabel>);
+    fn dispatch_on_main_thread(&self, runnable: Runnable);
+    fn dispatch_after(&self, duration: Duration, runnable: Runnable);
+    fn now(&self) -> Instant { Instant::now() }
 }
 ```
 
-### cancel 机制
-
-`async_task::Task` 利用 Rust 的标准取消机制——Drop：
-
-```rust
-let task = cx.spawn(|mut cx| async move {
-    smol::Timer::after(Duration::from_secs(5)).await;
-    cx.update(|cx| { /* 5 秒后执行 */ }).ok();
-});
-// ...
-task.cancel();  // Drop → Future 被取消 → Timer 被释放 → 回调不执行
-```
-
-这与 tokio 的 `JoinHandle::abort()` 不同——GPUI 的任务取消是**同步**的（`Drop` 是同步的）。
-
-## BackgroundExecutor 的使用
-
-```rust
-cx.background_executor()
-    .spawn(async move {
-        // 这个 async block 在后台线程池中运行
-        let result = compute_expensive_thing().await;
-        result
-    })
-    .detach();
-```
-
-或使用 `cx.spawn()` 的便利封装：
-
-```rust
-cx.spawn(|mut cx| async move {
-    // 后台线程中执行
-    let data = fetch_from_api().await;
-
-    // 回到主线程更新 UI
-    cx.update(|cx| {
-        // 现在可以安全修改 Entity 和触发 notify
-    }).ok();
-})
-.detach();
-```
+关键点：
+- **参数是 `Runnable`**（`async_task::Runnable`），不是 `Box<dyn FnOnce()>`。Runnable 是 smol 运行时的标准调度原语。
+- **`dispatch` 有可选的 `label: Option<TaskLabel>`**（用于性能追踪）。
+- **`dispatch_after`** 用于定时器（`smol::Timer` 基于此实现）。
+- **`now()`** 提供平台特定时钟（默认 `Instant::now()`）。
 
 ## smol::Timer
 
-GPUI 重新导出了 `smol::Timer`：
+GPUI 重新导出 `smol::Timer`：
 
 ```rust
-// 延迟操作
+// 延迟
 smol::Timer::after(Duration::from_millis(300)).await;
 
-// 定时器
+// 间隔
 let mut interval = smol::Timer::interval(Duration::from_secs(1));
 loop {
     interval.next().await;
-    // 每秒执行
 }
 ```
-
-`smol::Timer` 的实现在 macOS 上使用 `kqueue`，Linux 上使用 `timerfd`，Windows 上使用 `CreateWaitableTimer`。
-
-## PlatformDispatcher 的桥接
-
-```rust
-pub trait PlatformDispatcher: Send + Sync {
-    fn is_main_thread(&self) -> bool;
-    fn dispatch(&self, f: Box<dyn FnOnce() + Send>);  // 异步执行
-    fn dispatch_on_main_thread(&self, f: Box<dyn FnOnce() + Send>);  // 排队到主线程
-    fn dispatch_after(&self, duration: Duration, f: Box<dyn FnOnce() + Send>);  // 延迟执行
-}
-```
-
-平台实现：
-
-- **macOS**: GCD `dispatch_async` / `dispatch_async_f`（通过 bindgen 生成的 FFI 绑定）
-- **Linux/FreeBSD**: `calloop` 事件循环的 `EventLoop::wake()`
-- **Windows**: `PostMessage` 发送私有消息到消息循环
 
 ## 与平台事件循环的融合
 
 ```
-主线程（GUI 线程）:
-  ┌────────────────────────────────┐
-  │  平台事件循环                    │
-  │  ├─ CFRunLoop / calloop / MSG  │
-  │  │                              │
-  │  ├─ 操作系统事件（鼠标、键盘）     │
-  │  │   └─ App::update(callback)   │
-  │  │                              │
-  │  ├─ ForegroundExecutor 任务      │
-  │  │   └─ smol future polling     │
-  │  │                              │
-  │  └─ display_link / vsync        │
-  │      └─ Window::draw()          │
-  └────────────────────────────────┘
+主线程（GUI 线程）：
+  ┌──────────────────────────────────┐
+  │  平台事件循环                      │
+  │  ├─ CFRunLoop / calloop / MSG    │
+  │  ├─ OS 事件（鼠标、键盘）           │
+  │  │   └─ App::update(callback)     │
+  │  ├─ ForegroundExecutor 任务        │
+  │  │   └─ smol future 轮询          │
+  │  └─ display_link / vsync          │
+  │      └─ Window::draw()            │
+  └──────────────────────────────────┘
 
-后台线程池:
-  ┌───────────────────────────┐
-  │  BackgroundExecutor (N 线程) │
-  │  ├─ smol runtime           │
-  │  ├─ async-io (kqueue/epoll)│
-  │  └─ 用户 spawn 的 futures  │
-  └───────────────────────────┘
+后台线程池：
+  ┌──────────────────────────────┐
+  │  BackgroundExecutor (N 线程)   │
+  │  ├─ smol runtime              │
+  │  └─ 用户 spawn 的 futures     │
+  └──────────────────────────────┘
 ```
 
-主线程的 smol executor 只是事件循环的"乘客"——平台事件循环是主循环，smol 在其中被轮询。这与 tokio 的全接管模式不同（tokio 的 `#[tokio::main]` 接管了 `main` 函数）。
+主线程 smol executor 寄生在平台事件循环中——不是 tokio 的全接管模式。
+
+## 平台实现
+
+- **macOS**：GCD `dispatch_async_f`（底层通过 `src/platform/mac/dispatch.h` 的 bindgen 绑定）
+- **Linux/FreeBSD**：`calloop` 事件循环 + `eventfd` 唤醒
+- **Windows**：`PostMessage` + 私有消息
+
+所有平台实现都通过 `Runnable` 与 smol 的调度器对接——这是 smol 生态的标准模式。
 
 ## 常见的并发陷阱
 
-### 陷阱一：在 update() 中死锁
-
-```rust
-// 危险：在 update 回调中再次调用 update
-cx.update(|cx| {
-    let other = other_entity.clone();
-    cx.update_entity(&other, |entity, cx| {
-        // 此时已经在 &mut App 的借用中
-        // 如果 other_entity 和当前 entity 相同 → panic
-    });
-}).ok();
-```
-
-### 陷阱二：主线程阻塞
-
-```rust
-// 危险：在主线程上执行 CPU 密集工作
-cx.spawn(|mut cx| async move {
-    let result = expensive_calculation();  // ← 在主线程！（如果在 foreground spawn）
-    // ...
-})
-```
-
-使用 `cx.background_executor().spawn()` 将 CPU 工作移到后台。
-
-### 陷阱三：忘记 handle 错误
-
-```rust
-cx.spawn(|mut cx| async move {
-    smol::Timer::after(Duration::from_secs(1)).await;
-    cx.update(|cx| {
-        // 如果 App 已经退出，update 返回 Err
-        some_entity.update(cx, |entity, cx| { ... });
-    }).ok();  // ← 至少写 .ok()，否则编译警告
-}).detach();
-```
+1. **在 `update()` 回调中再次调用 `update()`**：会导致 `&mut App` 重复借用 → panic。
+2. **主线程阻塞**：CPU 密集工作放在 `BackgroundExecutor` 上，不要在主线程执行。
+3. **忘记 `.ok()`**：`AsyncApp::update()` 返回 `Result`，App 可能已退出。
 
 ---
 
-**如果你只记住一件事：** GPUI 用 smol（不是 tokio）作为异步运行时。主线程 smol executor 寄生在平台事件循环中。`ForegroundExecutor` 是 `!Send` 的（只在主线程），`BackgroundExecutor` 是线程池。
+**如果你只记住一件事：** `BackgroundExecutor` 和 `ForegroundExecutor` 都持有 `Arc<dyn PlatformDispatcher>`。`PlatformDispatcher::dispatch(runnable: Runnable)` 是 smol 的标准调度原语（不是 `Box<dyn FnOnce()>`）。`Task<T>` 实现 `Future` trait，通过 `.await` 等待（不是 `.await()` 方法），通过 `drop()` 取消（不是 `.cancel()` 方法）。

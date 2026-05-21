@@ -27,9 +27,10 @@ fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoE
 `Context<'a, T>` 的生命周期 `'a` 就是你对 `App` 的借用期。实际上它是一个**透明的新类型包装**：
 
 ```rust
+// src/app/context.rs:20-23
 pub struct Context<'a, T> {
     app: &'a mut App,
-    entity: WeakEntity<T>,
+    entity_state: WeakEntity<T>,
 }
 ```
 
@@ -60,25 +61,30 @@ cx.spawn(|mut cx: AsyncApp| async move {
 ## AsyncApp：跨 await 的上下文
 
 ```rust
+// src/app/async_context.rs:17-21
+#[derive(Clone)]
 pub struct AsyncApp {
-    app: Weak<AppCell>,      // 弱引用 App
-    background_executor: BackgroundExecutor,
-    foreground_executor: ForegroundExecutor,
+    pub(crate) app: Weak<AppCell>,
+    pub(crate) background_executor: BackgroundExecutor,
+    pub(crate) foreground_executor: ForegroundExecutor,
 }
 ```
 
 `AsyncApp` 是 `Clone` + `Send` + `'static`，设计用于在 async block 中跨 `.await` 持有。它通过 `Weak<AppCell>` 访问 App：
 
 ```rust
-impl AsyncApp {
-    pub fn update<R>(
+impl AppContext for AsyncApp {
+    type Result<T> = Result<T>;
+
+    fn new<T: 'static>(
         &mut self,
-        f: impl FnOnce(&mut App) -> R + Send
-    ) -> Result<R> {
-        let app = self.app.upgrade()?;    // 获取 Arc<AppCell>
-        let result = app.update(f)?;      // 借入 App
-        Ok(result)
+        build_entity: impl FnOnce(&mut Context<T>) -> T,
+    ) -> Self::Result<Entity<T>> {
+        let app = self.app.upgrade().context("app was released")?;
+        let mut app = app.borrow_mut();
+        Ok(app.new(build_entity))
     }
+    // ...
 }
 ```
 
